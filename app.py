@@ -127,6 +127,42 @@ def create_app():
 
     with app.app_context():
         db.create_all()
+
+        # Lightweight migration: email_verified column (added for the
+        # "verify before you can create a team" gate). Harmless to re-run —
+        # guarded by a check that the column already exists.
+        from sqlalchemy import text as _sql
+        try:
+            db.session.execute(_sql("ALTER TABLE users ADD COLUMN email_verified BOOLEAN DEFAULT 0"))
+            db.session.commit()
+            logger.info("✅ Migration: added users.email_verified")
+        except Exception:
+            db.session.rollback()
+
+        # Backfill: dev-mode users can't receive verification emails, so they
+        # are treated as verified. Real users get their status on next login.
+        try:
+            db.session.execute(_sql("UPDATE users SET email_verified = 1 WHERE firebase_uid LIKE 'dev_%'"))
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+        # Lightweight migration: team_members.status (join-request approval).
+        try:
+            db.session.execute(_sql("ALTER TABLE team_members ADD COLUMN status VARCHAR(20) DEFAULT 'active'"))
+            db.session.commit()
+            logger.info("✅ Migration: added team_members.status")
+        except Exception:
+            db.session.rollback()
+
+        # Lightweight migration: teams.require_approval (sub-group gate).
+        try:
+            db.session.execute(_sql("ALTER TABLE teams ADD COLUMN require_approval BOOLEAN DEFAULT 0"))
+            db.session.commit()
+            logger.info("✅ Migration: added teams.require_approval")
+        except Exception:
+            db.session.rollback()
+
         logger.info("✅ Database ready")
 
     try:

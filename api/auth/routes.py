@@ -30,6 +30,7 @@ def firebase_login():
     display_name = data.get("displayName", "")
     firebase_uid = None
     avatar_url   = ""
+    email_verified = False
 
     # Try real Firebase verification first
     try:
@@ -38,7 +39,8 @@ def firebase_login():
         email        = decoded.get("email", email)
         display_name = decoded.get("name", display_name) or email.split("@")[0]
         avatar_url   = decoded.get("picture", "")
-        logger.info(f"Firebase auth OK: {email}")
+        email_verified = bool(decoded.get("email_verified", False)) or bool(data.get("emailVerified", False))
+        logger.info(f"Firebase auth OK: {email} (verified={email_verified})")
     except Exception as firebase_err:
         # Dev mode fallback — reachable ONLY when the server itself is running
         # in development mode (FLASK_ENV=development, the local default).
@@ -55,6 +57,7 @@ def firebase_login():
                 return jsonify({"error": "Email required"}), 400
             firebase_uid = f"dev_{email.replace('@','_').replace('.','_')}"
             display_name = display_name or email.split("@")[0]
+            email_verified = True  # dev accounts can't receive verification emails
             logger.warning(f"Dev-mode login: {email}")
         else:
             logger.warning(
@@ -70,12 +73,14 @@ def firebase_login():
             email=email,
             display_name=display_name or email.split("@")[0],
             avatar_url=avatar_url,
+            email_verified=email_verified,
         )
         db.session.add(user)
-        logger.info(f"New user: {email}")
+        logger.info(f"New user: {email} (verified={email_verified})")
     else:
         user.last_seen    = datetime.utcnow()
         user.display_name = display_name or user.display_name
+        user.email_verified = email_verified
         if avatar_url:
             user.avatar_url = avatar_url
 
@@ -132,7 +137,13 @@ def update_profile():
 @require_auth
 def get_my_teams():
     memberships = TeamMember.query.filter_by(user_id=g.current_user.id).all()
-    return jsonify({"teams": [m.team.to_dict() for m in memberships if m.team]})
+    teams = []
+    for m in memberships:
+        if m.team:
+            data = m.team.to_dict()
+            data["membershipStatus"] = m.status or "active"
+            teams.append(data)
+    return jsonify({"teams": teams})
 
 
 @auth_bp.route("/teams", methods=["POST"])
@@ -143,16 +154,22 @@ def create_team():
     if not name:
         return jsonify({"error": "Team name required"}), 400
 
+    # Email-verification gate: an unverified email/password account may NOT
+    # create a team. Verified accounts (Google, dev-mode) pass through.
+    if not g.current_user.email_verified:
+        return jsonify({"error": "Please verify your email before creating a team."}), 403
+
     team = Team(
         name=name,
         description=data.get("description", ""),
         invite_code=_generate_invite_code(),
         created_by=g.current_user.id,
+        require_approval=bool(data.get("requireApproval", False)),
     )
     db.session.add(team)
     db.session.flush()
 
-    db.session.add(TeamMember(team_id=team.id, user_id=g.current_user.id, role="owner"))
+    db.session.add(TeamMember(team_id=team.id, user_id=g.current_user.id, role="owner", status="active"))
     db.session.add(ChatRoom(
         team_id=team.id, name="general",
         description="General discussion", room_type="general",
@@ -164,8 +181,10 @@ def create_team():
         description=f"{g.current_user.display_name} created the team",
     ))
     db.session.commit()
-    logger.info(f"Team '{name}' created by {g.current_user.email}")
-    return jsonify({"team": team.to_dict(include_members=True)}), 201
+    logger.info(f"Team '{name}' created by {g.current_user.email} (require_approval={team.require_approval})")
+    data = team.to_dict(include_members=True)
+    data["membershipStatus"] = "active"
+    return jsonify({"team": data}), 201
 
 
 @auth_bp.route("/teams/join", methods=["POST"])
@@ -176,17 +195,85 @@ def join_team():
     team = Team.query.filter_by(invite_code=code).first()
     if not team:
         return jsonify({"error": "Invalid invite code"}), 404
-    if TeamMember.query.filter_by(team_id=team.id, user_id=g.current_user.id).first():
+
+    existing = TeamMember.query.filter_by(team_id=team.id, user_id=g.current_user.id).first()
+    if existing:
+        if (existing.status or "active") == "pending":
+            return jsonify({"error": "Join request already sent — waiting for the server admin to approve"}), 409
         return jsonify({"error": "Already a member"}), 409
 
-    db.session.add(TeamMember(team_id=team.id, user_id=g.current_user.id, role="member"))
+    # Sub-groups (require_approval) need the owner's OK before the member is
+    # admitted; the main team joins directly.
+    status = "pending" if team.require_approval else "active"
+    db.session.add(TeamMember(team_id=team.id, user_id=g.current_user.id, role="member", status=status))
     db.session.add(ActivityLog(
         team_id=team.id, user_id=g.current_user.id,
-        action="member_joined", entity_type="team", entity_id=team.id,
-        description=f"{g.current_user.display_name} joined the team",
+        action="join_requested" if status == "pending" else "member_joined",
+        entity_type="team", entity_id=team.id,
+        description=f"{g.current_user.display_name} requested to join the team"
+                     if status == "pending"
+                     else f"{g.current_user.display_name} joined the team",
     ))
     db.session.commit()
-    return jsonify({"team": team.to_dict(include_members=True)})
+    data = team.to_dict(include_members=True)
+    data["membershipStatus"] = status
+    return jsonify({"team": data})
+
+
+# ── Join requests (sub-group admin approval) ──────────────────
+
+@auth_bp.route("/teams/<team_id>/requests", methods=["GET"])
+@require_auth
+def get_join_requests(team_id):
+    """List pending join requests — only the team owner can manage these."""
+    if not TeamMember.query.filter_by(
+        team_id=team_id, user_id=g.current_user.id, role="owner"
+    ).first():
+        return jsonify({"error": "Only the server owner can manage join requests"}), 403
+    pending = TeamMember.query.filter_by(team_id=team_id, status="pending").all()
+    return jsonify({"requests": [m.to_dict() for m in pending]})
+
+
+@auth_bp.route("/teams/<team_id>/requests/<membership_id>/approve", methods=["POST"])
+@require_auth
+def approve_join_request(team_id, membership_id):
+    if not TeamMember.query.filter_by(
+        team_id=team_id, user_id=g.current_user.id, role="owner"
+    ).first():
+        return jsonify({"error": "Only the server owner can approve join requests"}), 403
+    membership = TeamMember.query.filter_by(
+        id=membership_id, team_id=team_id, status="pending"
+    ).first()
+    if not membership:
+        return jsonify({"error": "Join request not found"}), 404
+    membership.status = "active"
+    membership.joined_at = datetime.utcnow()
+    db.session.add(ActivityLog(
+        team_id=team_id, user_id=membership.user_id,
+        action="member_approved", entity_type="team", entity_id=team_id,
+        description=f"{membership.user.display_name if membership.user else 'Member'} was approved",
+    ))
+    db.session.commit()
+    logger.info(f"Approved join request {membership_id} for team {team_id}")
+    return jsonify({"message": "Join request approved", "membership": membership.to_dict()})
+
+
+@auth_bp.route("/teams/<team_id>/requests/<membership_id>/reject", methods=["POST"])
+@require_auth
+def reject_join_request(team_id, membership_id):
+    if not TeamMember.query.filter_by(
+        team_id=team_id, user_id=g.current_user.id, role="owner"
+    ).first():
+        return jsonify({"error": "Only the server owner can reject join requests"}), 403
+    membership = TeamMember.query.filter_by(
+        id=membership_id, team_id=team_id, status="pending"
+    ).first()
+    if not membership:
+        return jsonify({"error": "Join request not found"}), 404
+    db.session.delete(membership)
+    db.session.commit()
+    logger.info(f"Rejected join request {membership_id} for team {team_id}")
+    return jsonify({"message": "Join request rejected"})
 
 
 @auth_bp.route("/teams/<team_id>", methods=["GET"])

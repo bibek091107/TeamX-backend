@@ -13,7 +13,11 @@ chat_bp = Blueprint("chat", __name__)
 
 
 def _is_team_member(team_id, user_id):
-    return TeamMember.query.filter_by(team_id=team_id, user_id=user_id).first()
+    """Membership that counts — pending join requests can't read the chat."""
+    m = TeamMember.query.filter_by(team_id=team_id, user_id=user_id).first()
+    if m is None:
+        return None
+    return m if (m.status or "active") == "active" else None
 
 
 def _is_team_owner(team_id, user_id):

@@ -29,6 +29,7 @@ class User(db.Model):
     avatar_url = db.Column(db.String(500))
     role = db.Column(db.String(20), default="member")
     is_active = db.Column(db.Boolean, default=True)
+    email_verified = db.Column(db.Boolean, default=False)
     last_seen = db.Column(db.DateTime, default=datetime.utcnow)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -47,6 +48,7 @@ class User(db.Model):
             "avatarUrl": self.avatar_url,
             "role": self.role,
             "isActive": self.is_active,
+            "emailVerified": self.email_verified,
             "lastSeen": self.last_seen.isoformat() if self.last_seen else None,
             "createdAt": self.created_at.isoformat()
         }
@@ -60,6 +62,10 @@ class Team(db.Model):
     description = db.Column(db.Text)
     avatar_url = db.Column(db.String(500))
     invite_code = db.Column(db.String(8), unique=True)
+    # When True, joining this team via invite code creates a PENDING
+    # membership that the team owner must approve. Sub-groups created from
+    # the chat "+" button opt in; the main team created on onboarding does not.
+    require_approval = db.Column(db.Boolean, default=False)
     created_by = db.Column(db.String(36), db.ForeignKey("users.id"))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -76,6 +82,7 @@ class Team(db.Model):
             "description": self.description,
             "avatarUrl": self.avatar_url,
             "inviteCode": self.invite_code,
+            "requireApproval": bool(self.require_approval),
             "createdBy": self.created_by,
             "memberCount": self.members.count(),
             "createdAt": self.created_at.isoformat()
@@ -92,6 +99,8 @@ class TeamMember(db.Model):
     team_id = db.Column(db.String(36), db.ForeignKey("teams.id"), nullable=False, index=True)
     user_id = db.Column(db.String(36), db.ForeignKey("users.id"), nullable=False, index=True)
     role = db.Column(db.String(20), default="member")
+    # "active" = full member, "pending" = join request awaiting owner approval.
+    status = db.Column(db.String(20), default="active")
     joined_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     team = db.relationship("Team", back_populates="members")
@@ -104,6 +113,7 @@ class TeamMember(db.Model):
             "userId": self.user_id,
             "user": self.user.to_dict() if self.user else None,
             "role": self.role,
+            "status": self.status,
             "joinedAt": self.joined_at.isoformat()
         }
 
