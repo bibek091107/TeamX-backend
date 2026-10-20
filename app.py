@@ -8,6 +8,11 @@ import os
 import sys
 from datetime import timedelta
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
+
 # Load .env FIRST before any other imports
 from dotenv import load_dotenv
 # Try multiple paths in case working directory differs
@@ -36,7 +41,7 @@ logger.add("logs/app.log", rotation="10 MB", retention="30 days", level="INFO")
 # ── Verify key loading ────────────────────────────────────────
 groq_key = os.getenv("GROQ_API_KEY", "")
 if groq_key:
-    logger.info(f"✅ GROQ_API_KEY loaded (starts with: {groq_key[:8]}...)")
+    logger.info("✅ GROQ_API_KEY loaded")
 else:
     logger.warning("⚠️  GROQ_API_KEY not found in .env — AI features will be disabled")
 
@@ -126,7 +131,12 @@ def create_app():
     register_socket_events(socketio)
 
     with app.app_context():
-        db.create_all()
+        try:
+            db.create_all()
+        except Exception as e:
+            logger.error(f"❌ Database initialization failed: {e}")
+            logger.error("Please verify that DATABASE_URL is valid and reachable.")
+            raise
 
         # Lightweight migration: email_verified column (added for the
         # "verify before you can create a team" gate). Harmless to re-run —
@@ -198,7 +208,7 @@ if __name__ == "__main__":
     app   = create_app()
     port  = int(os.getenv("PORT", 5000))
     debug = os.getenv("FLASK_ENV", "development") == "development"
-    logger.info(f"🌐 http://localhost:{port}")
+    logger.info(f"🌐 Server binding to 0.0.0.0:{port} (PORT={port})")
     socketio.run(
         app,
         host="0.0.0.0",
