@@ -173,6 +173,46 @@ def create_app():
         except Exception:
             db.session.rollback()
 
+        # Lightweight migration: chat_rooms.is_restricted
+        try:
+            db.session.execute(_sql("ALTER TABLE chat_rooms ADD COLUMN is_restricted BOOLEAN DEFAULT 0"))
+            db.session.commit()
+            logger.info("✅ Migration: added chat_rooms.is_restricted")
+        except Exception:
+            db.session.rollback()
+
+        # Lightweight migration: chat_rooms.is_archived
+        try:
+            db.session.execute(_sql("ALTER TABLE chat_rooms ADD COLUMN is_archived BOOLEAN DEFAULT 0"))
+            db.session.commit()
+            logger.info("✅ Migration: added chat_rooms.is_archived")
+        except Exception:
+            db.session.rollback()
+
+        # Lightweight migration: tasks.channel_id
+        try:
+            db.session.execute(_sql("ALTER TABLE tasks ADD COLUMN channel_id VARCHAR(36)"))
+            db.session.commit()
+            logger.info("✅ Migration: added tasks.channel_id")
+        except Exception:
+            db.session.rollback()
+
+        # Lightweight migration: notifications.extra_data
+        try:
+            db.session.execute(_sql("ALTER TABLE notifications ADD COLUMN extra_data TEXT"))
+            db.session.commit()
+            logger.info("✅ Migration: added notifications.extra_data")
+        except Exception:
+            db.session.rollback()
+
+        # Lightweight migration: chat_messages.reply_to_id (thread replies)
+        try:
+            db.session.execute(_sql("ALTER TABLE chat_messages ADD COLUMN reply_to_id VARCHAR(36)"))
+            db.session.commit()
+            logger.info("✅ Migration: added chat_messages.reply_to_id")
+        except Exception:
+            db.session.rollback()
+
         logger.info("✅ Database ready")
 
     try:

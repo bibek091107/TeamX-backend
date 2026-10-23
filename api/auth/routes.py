@@ -6,11 +6,17 @@ Fix 2: Added delete team endpoint for team creator.
 import os
 import random
 import string
-from datetime import datetime
+import secrets
+import hashlib
+from datetime import datetime, timedelta
 from flask import Blueprint, request, jsonify, g
 from flask_jwt_extended import create_access_token, create_refresh_token, jwt_required, get_jwt_identity
 from loguru import logger
-from models.database import db, User, Team, TeamMember, ActivityLog, ChatRoom, Task, KnowledgeItem, Notification, ChatMessage, DailySummary
+from models.database import (
+    db, User, Team, TeamMember, ActivityLog, ChatRoom, Task,
+    KnowledgeItem, Notification, ChatMessage, DailySummary,
+    WorkspaceInvitation, ChannelMember
+)
 from utils.auth_middleware import require_auth, verify_firebase_token
 
 auth_bp = Blueprint("auth", __name__)
@@ -143,7 +149,38 @@ def get_my_teams():
             data = m.team.to_dict()
             data["membershipStatus"] = m.status or "active"
             teams.append(data)
-    return jsonify({"teams": teams})
+
+    last_team_id = g.current_user.last_active_team_id
+    if last_team_id:
+        is_active_member = any(t["id"] == last_team_id and t.get("membershipStatus") == "active" for t in teams)
+        if not is_active_member:
+            last_team_id = None
+            g.current_user.last_active_team_id = None
+            db.session.commit()
+
+    return jsonify({
+        "teams": teams,
+        "lastActiveTeamId": last_team_id
+    })
+
+
+@auth_bp.route("/teams/select", methods=["POST"])
+@require_auth
+def select_team():
+    data = request.get_json() or {}
+    team_id = (data.get("teamId") or "").strip()
+    if not team_id:
+        return jsonify({"error": "Team ID required"}), 400
+
+    membership = TeamMember.query.filter_by(team_id=team_id, user_id=g.current_user.id).first()
+    if not membership or (membership.status or "active") != "active":
+        return jsonify({"error": "You are not an active member of this team"}), 403
+
+    g.current_user.last_active_team_id = team_id
+    db.session.commit()
+    data = membership.team.to_dict(include_members=True)
+    data["membershipStatus"] = "active"
+    return jsonify({"team": data, "lastActiveTeamId": team_id})
 
 
 @auth_bp.route("/teams", methods=["POST"])
@@ -180,11 +217,12 @@ def create_team():
         action="team_created", entity_type="team", entity_id=team.id,
         description=f"{g.current_user.display_name} created the team",
     ))
+    g.current_user.last_active_team_id = team.id
     db.session.commit()
     logger.info(f"Team '{name}' created by {g.current_user.email} (require_approval={team.require_approval})")
     data = team.to_dict(include_members=True)
     data["membershipStatus"] = "active"
-    return jsonify({"team": data}), 201
+    return jsonify({"team": data, "lastActiveTeamId": team.id}), 201
 
 
 @auth_bp.route("/teams/join", methods=["POST"])
@@ -214,10 +252,12 @@ def join_team():
                      if status == "pending"
                      else f"{g.current_user.display_name} joined the team",
     ))
+    if status == "active":
+        g.current_user.last_active_team_id = team.id
     db.session.commit()
     data = team.to_dict(include_members=True)
     data["membershipStatus"] = status
-    return jsonify({"team": data})
+    return jsonify({"team": data, "lastActiveTeamId": g.current_user.last_active_team_id})
 
 
 # ── Join requests (sub-group admin approval) ──────────────────
@@ -361,3 +401,219 @@ def delete_team(team_id):
         db.session.rollback()
         logger.error(f"Team deletion failed: {e}")
         return jsonify({"error": "Failed to delete team"}), 500
+
+
+# ─────────────────────────────────────────────
+# SECURE WORKSPACE & CHANNEL INVITATIONS
+# ─────────────────────────────────────────────
+
+def _is_team_admin(team_id, user_id):
+    if not team_id or not user_id:
+        return False
+    u = User.query.get(user_id)
+    if u and getattr(u, "role", None) == "admin":
+        return True
+    m = TeamMember.query.filter_by(team_id=team_id, user_id=user_id).first()
+    return m is not None and m.role in ("owner", "admin") and (m.status or "active") == "active"
+
+
+@auth_bp.route("/teams/<team_id>/invitations", methods=["POST"])
+@require_auth
+def create_invitation(team_id):
+    """
+    Admins create a secure single-use invitation for an email address.
+    Optionally pre-assigns the user to a specific channel.
+    """
+    if not _is_team_admin(team_id, g.current_user.id):
+        return jsonify({"error": "Only team admins can create invitations"}), 403
+
+    team = Team.query.get_or_404(team_id)
+    data = request.get_json() or {}
+    email = data.get("email", "").strip().lower()
+    if not email or "@" not in email:
+        return jsonify({"error": "Valid email address required"}), 400
+
+    channel_id = data.get("channelId") or data.get("channel_id")
+    if channel_id:
+        channel = ChatRoom.query.filter_by(id=channel_id, team_id=team_id).first()
+        if not channel:
+            return jsonify({"error": "Specified channel not found in this team"}), 400
+
+    role = data.get("role", "member")
+    if role not in ("member", "admin"):
+        role = "member"
+
+    expires_in_days = int(data.get("expiresInDays", 7))
+    expires_at = datetime.utcnow() + timedelta(days=expires_in_days)
+
+    # Generate cryptographically secure token and store only the SHA-256 hash
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+    # Expire previous pending invitations for this email + team
+    WorkspaceInvitation.query.filter_by(
+        team_id=team_id, email=email, status="pending"
+    ).update({"status": "revoked"})
+
+    invitation = WorkspaceInvitation(
+        team_id=team_id,
+        channel_id=channel_id,
+        inviter_id=g.current_user.id,
+        email=email,
+        role=role,
+        token_hash=token_hash,
+        status="pending",
+        expires_at=expires_at,
+    )
+    db.session.add(invitation)
+    db.session.commit()
+
+    inv_dict = invitation.to_dict()
+    inv_dict["token"] = raw_token
+    # Build web invite URL for direct browser access
+    frontend_url = os.getenv("FRONTEND_URL", "https://teamx-brain.onrender.com")
+    inv_dict["inviteUrl"] = f"{frontend_url}/invite/{raw_token}"
+
+    logger.info(f"Created invitation for {email} to team '{team.name}' by {g.current_user.email}")
+    return jsonify({"invitation": inv_dict, "token": raw_token, "inviteUrl": inv_dict["inviteUrl"]}), 201
+
+
+@auth_bp.route("/invitations/<token>", methods=["GET"])
+def get_invitation_details(token):
+    """
+    Public lookup for invitation details before acceptance.
+    Validates token hash, status, and expiry.
+    """
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    inv = WorkspaceInvitation.query.filter_by(token_hash=token_hash).first()
+
+    if not inv:
+        return jsonify({"error": "Invalid invitation link"}), 404
+
+    if inv.status == "revoked":
+        return jsonify({"error": "This invitation has been revoked"}), 410
+
+    if inv.status == "accepted":
+        return jsonify({"error": "This invitation has already been accepted"}), 410
+
+    if inv.expires_at < datetime.utcnow():
+        inv.status = "expired"
+        db.session.commit()
+        return jsonify({"error": "This invitation has expired"}), 410
+
+    return jsonify({"invitation": inv.to_dict()})
+
+
+@auth_bp.route("/invitations/<token>/accept", methods=["POST"])
+@require_auth
+def accept_invitation(token):
+    """
+    Authenticated user accepts an invitation.
+    Enforces email verification match between invitation and authenticated user.
+    """
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    inv = WorkspaceInvitation.query.filter_by(token_hash=token_hash).first()
+
+    if not inv:
+        return jsonify({"error": "Invalid invitation link"}), 404
+
+    if inv.status != "pending":
+        return jsonify({"error": f"Invitation is no longer active (status: {inv.status})"}), 400
+
+    if inv.expires_at < datetime.utcnow():
+        inv.status = "expired"
+        db.session.commit()
+        return jsonify({"error": "This invitation has expired"}), 410
+
+    # Security check: Recipient email must match authenticated user's email
+    user_email = (g.current_user.email or "").strip().lower()
+    inv_email = (inv.email or "").strip().lower()
+    if user_email != inv_email:
+        return jsonify({
+            "error": f"This invitation was sent to {inv_email}. You are currently signed in as {user_email}. Please switch accounts to accept."
+        }), 403
+
+    # Add user to team
+    existing_team_member = TeamMember.query.filter_by(
+        team_id=inv.team_id, user_id=g.current_user.id
+    ).first()
+
+    if not existing_team_member:
+        tm = TeamMember(
+            team_id=inv.team_id,
+            user_id=g.current_user.id,
+            role=inv.role or "member",
+            status="active",
+        )
+        db.session.add(tm)
+    else:
+        existing_team_member.status = "active"
+        if inv.role == "admin":
+            existing_team_member.role = "admin"
+
+    # If linked to a channel, automatically add user as approved member
+    if inv.channel_id:
+        existing_chan_member = ChannelMember.query.filter_by(
+            room_id=inv.channel_id, user_id=g.current_user.id
+        ).first()
+
+        if not existing_chan_member:
+            cm = ChannelMember(
+                room_id=inv.channel_id,
+                user_id=g.current_user.id,
+                role=inv.role or "member",
+                status="approved",
+                approved_at=datetime.utcnow(),
+                approved_by=inv.inviter_id,
+            )
+            db.session.add(cm)
+        else:
+            existing_chan_member.status = "approved"
+
+    # Mark invitation accepted
+    inv.status = "accepted"
+    inv.accepted_at = datetime.utcnow()
+    inv.accepted_by = g.current_user.id
+
+    db.session.add(ActivityLog(
+        team_id=inv.team_id, user_id=g.current_user.id,
+        action="member_joined", entity_type="invitation", entity_id=inv.id,
+        description=f"{g.current_user.display_name} joined via invitation",
+    ))
+
+    db.session.commit()
+    logger.info(f"User {g.current_user.email} accepted invitation to team {inv.team_id}")
+
+    return jsonify({
+        "success": True,
+        "message": f"Successfully joined {inv.team.name if inv.team else 'team'}",
+        "team": inv.team.to_dict(include_members=True) if inv.team else None,
+        "channelId": inv.channel_id,
+    })
+
+
+@auth_bp.route("/teams/<team_id>/invitations", methods=["GET"])
+@require_auth
+def get_team_invitations(team_id):
+    """Admins view all sent invitations for their team."""
+    if not _is_team_admin(team_id, g.current_user.id):
+        return jsonify({"error": "Only team admins can view invitations"}), 403
+
+    invitations = WorkspaceInvitation.query.filter_by(team_id=team_id).order_by(
+        WorkspaceInvitation.created_at.desc()
+    ).all()
+    return jsonify({"invitations": [i.to_dict() for i in invitations]})
+
+
+@auth_bp.route("/teams/<team_id>/invitations/<invitation_id>/revoke", methods=["POST"])
+@require_auth
+def revoke_invitation(team_id, invitation_id):
+    """Admin revokes an invitation before it is accepted."""
+    if not _is_team_admin(team_id, g.current_user.id):
+        return jsonify({"error": "Only team admins can revoke invitations"}), 403
+
+    inv = WorkspaceInvitation.query.filter_by(id=invitation_id, team_id=team_id).first_or_404()
+    inv.status = "revoked"
+    db.session.commit()
+    return jsonify({"success": True, "message": "Invitation revoked"})
+

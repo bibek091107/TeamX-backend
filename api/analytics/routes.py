@@ -82,8 +82,13 @@ def get_dashboard(team_id):
 @require_auth
 def get_analytics(team_id):
     """Detailed analytics for analytics dashboard."""
-    if not TeamMember.query.filter_by(team_id=team_id, user_id=g.current_user.id).first():
+    membership = TeamMember.query.filter_by(team_id=team_id, user_id=g.current_user.id).first()
+    if not membership or (membership.status or "active") != "active":
         return jsonify({"error": "Access denied"}), 403
+
+    from models.database import User
+    current_u = User.query.get(g.current_user.id)
+    is_admin = (membership.role in ("owner", "admin")) or (current_u and getattr(current_u, "role", None) == "admin")
 
     now = datetime.utcnow()
     all_tasks = Task.query.filter_by(team_id=team_id).all()
@@ -91,7 +96,9 @@ def get_analytics(team_id):
 
     # Per-member stats
     member_stats = []
-    for m in members:
+    # If not admin, restrict memberStats to only current user
+    eval_members = members if is_admin else [m for m in members if m.user_id == g.current_user.id]
+    for m in eval_members:
         if not m.user:
             continue
         user_tasks = [t for t in all_tasks if t.assignee_id == m.user_id]
@@ -125,6 +132,7 @@ def get_analytics(team_id):
         avg_completion_days = round(sum(days_list) / len(days_list), 1) if days_list else 0
 
     return jsonify({
+        "isAdmin": is_admin,
         "overview": {
             "totalTasks": len(all_tasks),
             "completionRate": round(len(completed) / len(all_tasks) * 100, 1) if all_tasks else 0,
