@@ -41,9 +41,8 @@ from services.firestore_service import (
 def firebase_login():
     data         = request.get_json() or {}
     id_token     = data.get("idToken", "")
-    raw_email    = data.get("email", "")
-    norm_email   = raw_email.strip().lower() if raw_email else ""
-    display_name = data.get("displayName", "")
+    norm_email   = ""
+    display_name = ""
     firebase_uid = None
     avatar_url   = ""
     email_verified = False
@@ -52,15 +51,20 @@ def firebase_login():
     try:
         decoded        = verify_firebase_token(id_token)
         firebase_uid   = decoded["uid"]
-        token_email    = (decoded.get("email") or "").strip().lower()
-        norm_email     = token_email or norm_email
-        display_name   = decoded.get("name", display_name) or norm_email.split("@")[0]
+        norm_email     = (decoded.get("email") or "").strip().lower()
+        display_name   = decoded.get("name") or norm_email.split("@")[0]
         avatar_url     = decoded.get("picture", "")
-        email_verified = bool(decoded.get("email_verified", False)) or bool(data.get("emailVerified", False))
-        logger.info(f"Firebase auth OK: {norm_email} (uid={firebase_uid}, verified={email_verified})")
+        email_verified = bool(decoded.get("email_verified", False))
+        logger.info(f"Firebase auth OK: {norm_email} (verified={email_verified})")
     except Exception as firebase_err:
-        is_dev = os.getenv("FLASK_ENV", "development") == "development"
+        is_dev = (
+            os.getenv("FLASK_ENV", "").strip().lower() == "development"
+            and os.getenv("ALLOW_DEV_AUTH", "").strip().lower() == "true"
+        )
         if is_dev:
+            raw_email = data.get("email", "")
+            norm_email = raw_email.strip().lower() if raw_email else ""
+            display_name = data.get("displayName", "")
             if not norm_email:
                 norm_email = "dev@teamx.app"
             firebase_uid   = f"dev_{norm_email.replace('@','_').replace('.','_')}"
@@ -68,12 +72,9 @@ def firebase_login():
             email_verified = True  # dev accounts can't receive verification emails
             logger.warning(f"Dev-mode login: {norm_email} (uid={firebase_uid})")
         else:
-            err_str = str(firebase_err)
-            logger.warning(
-                f"Rejected unverifiable Firebase token outside dev mode: {err_str}"
-            )
+            logger.warning("Rejected unverifiable Firebase token outside development mode")
             # Distinguish "Firebase not configured" from genuinely invalid tokens
-            if "not configured" in err_str.lower():
+            if "not configured" in str(firebase_err).lower():
                 return jsonify({
                     "error": "Server authentication is not configured. Please contact the admin.",
                     "code": "firebase_not_configured",
@@ -723,4 +724,3 @@ def revoke_invitation(team_id, invitation_id):
     inv.status = "revoked"
     db.session.commit()
     return jsonify({"success": True, "message": "Invitation revoked"})
-

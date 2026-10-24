@@ -22,10 +22,10 @@ for env_path in [".env", "backend/.env", os.path.join(os.path.dirname(__file__),
         break
 
 from flask import Flask
-from flask_cors import CORS
 from flask_jwt_extended import JWTManager
 from flask_socketio import SocketIO
 from loguru import logger
+from utils.cors_config import configure_cors
 
 # ── Logging ───────────────────────────────────────────────────
 logger.remove()
@@ -105,23 +105,8 @@ def create_app():
     from models.database import db
     db.init_app(app)
 
-    default_origins = (
-        "https://team-x-frontend.vercel.app,"
-        "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000"
-    )
-    origins = [
-        o.strip().rstrip("/") for o in
-        os.getenv("ALLOWED_ORIGINS", default_origins).split(",")
-        if o.strip()
-    ]
+    origins = configure_cors(app, os.getenv("ALLOWED_ORIGINS"))
     logger.info(f"CORS allowed origins: {origins}")
-    CORS(
-        app,
-        origins=origins,
-        supports_credentials=True,
-        allow_headers=["Content-Type", "Authorization"],
-        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    )
     jwt.init_app(app)
     socketio.init_app(app)
 
