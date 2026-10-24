@@ -5,6 +5,7 @@ RAG pipeline: Upload → Extract → Embed → Store → Search
 
 import os
 import uuid
+import re
 from pathlib import Path
 from flask import Blueprint, request, jsonify, g
 from werkzeug.utils import secure_filename
@@ -200,6 +201,38 @@ def semantic_search(team_id):
 
     # 1. Vector search
     results = vector_service.search(team_id=team_id, query=query, top_k=5)
+
+    # Render instances may not have FAISS/embeddings installed, and their local
+    # vector directory is ephemeral. Search the durable team-scoped DB content
+    # when the optional vector index has no matches.
+    if not results:
+        terms = {
+            term for term in re.findall(r"[\w'-]+", query.casefold())
+            if len(term) >= 3
+        }
+        if terms:
+            items = KnowledgeItem.query.filter_by(team_id=team_id)\
+                .order_by(KnowledgeItem.created_at.desc()).limit(500).all()
+            ranked = []
+            for item in items:
+                words = (item.content or "").split()
+                if not words:
+                    continue
+                chunks = [" ".join(words[i:i + 450]) for i in range(0, len(words), 400)] or [item.content]
+                best = None
+                for chunk in chunks:
+                    chunk_terms = set(re.findall(r"[\w'-]+", chunk.casefold()))
+                    title_terms = set(re.findall(r"[\w'-]+", (item.title or "").casefold()))
+                    matched = len(terms & chunk_terms)
+                    if not matched:
+                        continue
+                    score = matched / len(terms) + (0.25 if terms & title_terms else 0)
+                    candidate = {"doc_id": item.id, "content": chunk, "score": score}
+                    if best is None or candidate["score"] > best["score"]:
+                        best = candidate
+                if best:
+                    ranked.append(best)
+            results = sorted(ranked, key=lambda result: result["score"], reverse=True)[:5]
 
     # Enrich with DB metadata
     context_docs = []

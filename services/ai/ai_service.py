@@ -27,7 +27,8 @@ def _groq_client():
         logger.warning("groq not installed — run: pip install groq httpx")
         return None
     except Exception as e:
-        logger.warning(f"Groq client init error: {e}")
+        # SDK exceptions can contain request details. Keep startup logs safe.
+        logger.warning(f"Groq client init failed ({type(e).__name__})")
         return None
 
 
@@ -75,8 +76,8 @@ def ai_complete(prompt: str, system: str = "", max_tokens: int = 2000) -> str:
         else:
             errors.append("Groq: client not available (key missing or not installed)")
     except Exception as e:
-        errors.append(f"Groq: {e}")
-        logger.warning(f"Groq failed: {e}")
+        errors.append(f"Groq: {type(e).__name__}")
+        logger.warning(f"Groq request failed ({type(e).__name__})")
 
     # 2. OpenAI (fallback 1)
     try:
@@ -87,8 +88,8 @@ def ai_complete(prompt: str, system: str = "", max_tokens: int = 2000) -> str:
         else:
             errors.append("OpenAI: client not available")
     except Exception as e:
-        errors.append(f"OpenAI: {e}")
-        logger.warning(f"OpenAI failed: {e}")
+        errors.append(f"OpenAI: {type(e).__name__}")
+        logger.warning(f"OpenAI request failed ({type(e).__name__})")
 
     # 3. Gemini (fallback 2)
     try:
@@ -99,8 +100,8 @@ def ai_complete(prompt: str, system: str = "", max_tokens: int = 2000) -> str:
         else:
             errors.append("Gemini: client not available")
     except Exception as e:
-        errors.append(f"Gemini: {e}")
-        logger.warning(f"Gemini failed: {e}")
+        errors.append(f"Gemini: {type(e).__name__}")
+        logger.warning(f"Gemini request failed ({type(e).__name__})")
 
     detail = " | ".join(errors)
     raise RuntimeError(
@@ -120,16 +121,25 @@ def _try_groq(prompt: str, system: str, max_tokens: int) -> Optional[str]:
         msgs.append({"role": "system", "content": system})
     msgs.append({"role": "user", "content": prompt})
 
-    # Try models in order — use env var first, then fallbacks
-    preferred = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
-    fallbacks  = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "llama-3.1-70b-versatile", "gemma2-9b-it"]
+    # Llama 3.1/3.3 were retired by Groq in 2026. Prefer currently supported
+    # production models, while allowing an explicit deployment override.
+    preferred = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
+    fallbacks = ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"]
     # Deduplicate: preferred first, then rest
     models = [preferred] + [m for m in fallbacks if m != preferred]
     for model in models:
         try:
+            model_messages = msgs
+            if model.startswith("openai/gpt-oss-") and system:
+                # Groq's GPT-OSS guidance recommends keeping instructions in
+                # the user message rather than a system role.
+                model_messages = [{
+                    "role": "user",
+                    "content": f"{system.strip()}\n\n{prompt}",
+                }]
             r = client.chat.completions.create(
-                model=model, messages=msgs,
-                max_tokens=max_tokens, temperature=0.3,
+                model=model, messages=model_messages,
+                max_completion_tokens=max_tokens, temperature=0.3,
             )
             logger.debug(f"Groq model used: {model}")
             return r.choices[0].message.content
