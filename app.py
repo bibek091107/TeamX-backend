@@ -235,6 +235,7 @@ def create_app():
         from services.ai.vector_service import FAISS_AVAILABLE, ST_AVAILABLE
         from services.ai.ai_service import check_ai_providers
         providers = check_ai_providers()
+        from utils.auth_middleware import firebase_status
         return {
             "status":   "healthy",
             "service":  "AI Team Brain",
@@ -242,6 +243,7 @@ def create_app():
             "python":   sys.version.split()[0],
             "ai":       providers,
             "groq_key": bool(os.getenv("GROQ_API_KEY")),
+            "firebase_admin": firebase_status(),
             "features": {"faiss": FAISS_AVAILABLE, "embeddings": ST_AVAILABLE},
         }
 

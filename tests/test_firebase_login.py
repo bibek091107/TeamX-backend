@@ -28,6 +28,7 @@ class FirebaseLoginTests(unittest.TestCase):
             db.session.remove()
             db.engine.dispose()
 
+    @patch("api.auth.routes.firebase_status", return_value={"ready": True})
     @patch("api.auth.routes.sync_user_teams")
     @patch(
         "api.auth.routes.verify_firebase_token",
@@ -38,7 +39,7 @@ class FirebaseLoginTests(unittest.TestCase):
             "email_verified": False,
         },
     )
-    def test_login_uses_verified_claims_not_client_identity(self, _verify, _sync):
+    def test_login_uses_verified_claims_not_client_identity(self, _verify, _sync, _status):
         with patch.dict("os.environ", {"FLASK_ENV": "production"}):
             response = self.client.post(
                 "/api/auth/firebase-login",
@@ -58,8 +59,9 @@ class FirebaseLoginTests(unittest.TestCase):
             user = User.query.filter_by(firebase_uid="verified-firebase-uid").one()
             self.assertEqual(user.email, "verified@example.com")
 
+    @patch("api.auth.routes.firebase_status", return_value={"ready": True})
     @patch("api.auth.routes.verify_firebase_token", side_effect=ValueError("invalid token"))
-    def test_production_rejects_unverifiable_token(self, _verify):
+    def test_production_rejects_unverifiable_token(self, _verify, _status):
         with patch.dict("os.environ", {"FLASK_ENV": "production"}):
             response = self.client.post(
                 "/api/auth/firebase-login",
@@ -70,8 +72,9 @@ class FirebaseLoginTests(unittest.TestCase):
         with self.app.app_context():
             self.assertEqual(User.query.count(), 0)
 
+    @patch("api.auth.routes.firebase_status", return_value={"ready": True})
     @patch("api.auth.routes.verify_firebase_token", side_effect=ValueError("invalid token"))
-    def test_development_mock_auth_requires_explicit_opt_in(self, _verify):
+    def test_development_rejects_unverifiable_token(self, _verify, _status):
         with patch.dict("os.environ", {"FLASK_ENV": "development"}, clear=True):
             response = self.client.post(
                 "/api/auth/firebase-login",
@@ -82,23 +85,18 @@ class FirebaseLoginTests(unittest.TestCase):
         with self.app.app_context():
             self.assertEqual(User.query.count(), 0)
 
-    @patch("api.auth.routes.verify_firebase_token", side_effect=ValueError("invalid token"))
-    @patch("api.auth.routes.sync_user_teams")
-    def test_local_mock_auth_requires_explicit_opt_in(self, _sync, _verify):
-        with patch.dict(
-            "os.environ",
-            {"FLASK_ENV": "development", "ALLOW_DEV_AUTH": "true"},
-            clear=True,
-        ):
-            response = self.client.post(
-                "/api/auth/firebase-login",
-                json={"idToken": "invalid", "email": "local-dev@example.com"},
-            )
+    def test_missing_token_returns_400(self):
+        response = self.client.post("/api/auth/firebase-login", json={"email": "ignored@example.com"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json["code"], "missing_id_token")
 
-        self.assertEqual(response.status_code, 200)
+    @patch("api.auth.routes.firebase_status", return_value={"ready": False})
+    @patch("api.auth.routes.verify_firebase_token", side_effect=RuntimeError("not initialized"))
+    def test_missing_credentials_return_503_without_creating_user(self, _verify, _status):
+        response = self.client.post("/api/auth/firebase-login", json={"idToken": "opaque"})
+        self.assertEqual(response.status_code, 503)
         with self.app.app_context():
-            user = User.query.filter_by(email="local-dev@example.com").one()
-            self.assertTrue(user.email_verified)
+            self.assertEqual(User.query.count(), 0)
 
 
 if __name__ == "__main__":

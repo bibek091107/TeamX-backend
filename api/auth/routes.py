@@ -17,7 +17,7 @@ from models.database import (
     KnowledgeItem, Notification, ChatMessage, DailySummary,
     WorkspaceInvitation, ChannelMember
 )
-from utils.auth_middleware import require_auth, verify_firebase_token
+from utils.auth_middleware import require_auth, verify_firebase_token, firebase_status
 
 auth_bp = Blueprint("auth", __name__)
 
@@ -39,13 +39,16 @@ from services.firestore_service import (
 
 @auth_bp.route("/firebase-login", methods=["POST"])
 def firebase_login():
-    data         = request.get_json() or {}
+    data         = request.get_json(silent=True) or {}
     id_token     = data.get("idToken", "")
     norm_email   = ""
     display_name = ""
     firebase_uid = None
     avatar_url   = ""
     email_verified = False
+
+    if not isinstance(id_token, str) or not id_token.strip():
+        return jsonify({"error": "A Firebase ID token is required.", "code": "missing_id_token"}), 400
 
     # Try real Firebase verification first
     try:
@@ -56,33 +59,17 @@ def firebase_login():
         avatar_url     = decoded.get("picture", "")
         email_verified = bool(decoded.get("email_verified", False))
         logger.info(f"Firebase auth OK: {norm_email} (verified={email_verified})")
-    except Exception as firebase_err:
-        is_dev = (
-            os.getenv("FLASK_ENV", "").strip().lower() == "development"
-            and os.getenv("ALLOW_DEV_AUTH", "").strip().lower() == "true"
-        )
-        if is_dev:
-            raw_email = data.get("email", "")
-            norm_email = raw_email.strip().lower() if raw_email else ""
-            display_name = data.get("displayName", "")
-            if not norm_email:
-                norm_email = "dev@teamx.app"
-            firebase_uid   = f"dev_{norm_email.replace('@','_').replace('.','_')}"
-            display_name   = display_name or norm_email.split("@")[0]
-            email_verified = True  # dev accounts can't receive verification emails
-            logger.warning(f"Dev-mode login: {norm_email} (uid={firebase_uid})")
-        else:
-            logger.warning("Rejected unverifiable Firebase token outside development mode")
-            # Distinguish "Firebase not configured" from genuinely invalid tokens
-            if "not configured" in str(firebase_err).lower():
-                return jsonify({
-                    "error": "Server authentication is not configured. Please contact the admin.",
-                    "code": "firebase_not_configured",
-                }), 503
+    except Exception:
+        logger.warning("Rejected unverifiable Firebase ID token")
+        if not firebase_status()["ready"]:
             return jsonify({
-                "error": "Invalid or expired authentication token. Please sign in again.",
-                "code": "invalid_token",
-            }), 401
+                "error": "Server authentication is temporarily unavailable. Please contact the admin.",
+                "code": "firebase_not_configured",
+            }), 503
+        return jsonify({
+            "error": "Invalid or expired authentication token. Please sign in again.",
+            "code": "invalid_token",
+        }), 401
 
     if not norm_email:
         return jsonify({"error": "Email is required"}), 400
