@@ -105,11 +105,23 @@ def create_app():
     from models.database import db
     db.init_app(app)
 
-    origins = os.getenv(
-        "ALLOWED_ORIGINS",
+    default_origins = (
+        "https://team-x-frontend.vercel.app,"
         "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000"
-    ).split(",")
-    CORS(app, origins=origins, supports_credentials=True)
+    )
+    origins = [
+        o.strip().rstrip("/") for o in
+        os.getenv("ALLOWED_ORIGINS", default_origins).split(",")
+        if o.strip()
+    ]
+    logger.info(f"CORS allowed origins: {origins}")
+    CORS(
+        app,
+        origins=origins,
+        supports_credentials=True,
+        allow_headers=["Content-Type", "Authorization"],
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    )
     jwt.init_app(app)
     socketio.init_app(app)
 

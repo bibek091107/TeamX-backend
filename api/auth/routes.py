@@ -68,10 +68,20 @@ def firebase_login():
             email_verified = True  # dev accounts can't receive verification emails
             logger.warning(f"Dev-mode login: {norm_email} (uid={firebase_uid})")
         else:
+            err_str = str(firebase_err)
             logger.warning(
-                f"Rejected unverifiable Firebase token outside dev mode: {firebase_err}"
+                f"Rejected unverifiable Firebase token outside dev mode: {err_str}"
             )
-            return jsonify({"error": "Invalid Firebase token"}), 401
+            # Distinguish "Firebase not configured" from genuinely invalid tokens
+            if "not configured" in err_str.lower():
+                return jsonify({
+                    "error": "Server authentication is not configured. Please contact the admin.",
+                    "code": "firebase_not_configured",
+                }), 503
+            return jsonify({
+                "error": "Invalid or expired authentication token. Please sign in again.",
+                "code": "invalid_token",
+            }), 401
 
     if not norm_email:
         return jsonify({"error": "Email is required"}), 400
