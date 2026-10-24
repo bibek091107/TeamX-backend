@@ -5,7 +5,7 @@ from flask import Flask
 from flask_jwt_extended import JWTManager
 
 from api.auth.routes import auth_bp
-from models.database import User, db
+from models.database import User, Team, TeamMember, db
 
 
 class FirebaseLoginTests(unittest.TestCase):
@@ -97,6 +97,39 @@ class FirebaseLoginTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         with self.app.app_context():
             self.assertEqual(User.query.count(), 0)
+
+    @patch("api.auth.routes.firebase_status", return_value={"ready": True})
+    @patch("api.auth.routes.sync_user_teams")
+    @patch("api.auth.routes.verify_firebase_token", return_value={
+        "uid": "returning-firebase-uid",
+        "email": "returning@example.com",
+        "name": "Returning Member",
+        "email_verified": True,
+    })
+    def test_existing_user_login_returns_existing_profile_and_team_memberships(self, _verify, _sync, _status):
+        with self.app.app_context():
+            user = User(firebase_uid="returning-firebase-uid", email="returning@example.com", display_name="Saved Profile")
+            db.session.add(user)
+            db.session.flush()
+            team = Team(id="existing-team-id", name="Existing Team", invite_code="TEAM1234", created_by=user.id)
+            db.session.add(team)
+            db.session.flush()
+            db.session.add(TeamMember(team_id=team.id, user_id=user.id, role="owner", status="active"))
+            db.session.commit()
+            existing_user_id = user.id
+
+        response = self.client.post("/api/auth/firebase-login", json={"idToken": "verified-existing-user-token"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["user"]["id"], existing_user_id)
+        self.assertEqual(response.json["user"]["displayName"], "Returning Member")
+        self.assertEqual(len(response.json["teams"]), 1)
+        self.assertEqual(response.json["teams"][0]["id"], "existing-team-id")
+        self.assertEqual(response.json["teams"][0]["membershipStatus"], "active")
+        with self.app.app_context():
+            self.assertEqual(User.query.count(), 1)
+            self.assertEqual(Team.query.count(), 1)
+            self.assertEqual(TeamMember.query.count(), 1)
 
 
 if __name__ == "__main__":
