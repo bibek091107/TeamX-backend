@@ -90,11 +90,17 @@ class FirebaseLoginTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json["code"], "missing_id_token")
 
-    @patch("api.auth.routes.firebase_status", return_value={"ready": False})
+    @patch("api.auth.routes.firebase_status", return_value={
+        "ready": False,
+        "reason": "incomplete_environment_credentials",
+        "missing_env_vars": ["FIREBASE_PRIVATE_KEY"],
+    })
     @patch("api.auth.routes.verify_firebase_token", side_effect=RuntimeError("not initialized"))
     def test_missing_credentials_return_503_without_creating_user(self, _verify, _status):
         response = self.client.post("/api/auth/firebase-login", json={"idToken": "opaque"})
         self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json["diagnostic"], "incomplete_environment_credentials")
+        self.assertEqual(response.json["missingConfiguration"], ["FIREBASE_PRIVATE_KEY"])
         with self.app.app_context():
             self.assertEqual(User.query.count(), 0)
 

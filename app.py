@@ -18,7 +18,9 @@ from dotenv import load_dotenv
 # Try multiple paths in case working directory differs
 for env_path in [".env", "backend/.env", os.path.join(os.path.dirname(__file__), ".env")]:
     if os.path.exists(env_path):
-        load_dotenv(env_path, override=True)
+        # Render's injected environment is authoritative. A checked-out/local
+        # .env may fill unset values but must never replace Render secrets.
+        load_dotenv(env_path, override=False)
         break
 
 from flask import Flask

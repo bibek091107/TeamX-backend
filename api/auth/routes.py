@@ -61,10 +61,13 @@ def firebase_login():
         logger.info(f"Firebase auth OK: {norm_email} (verified={email_verified})")
     except Exception:
         logger.warning("Rejected unverifiable Firebase ID token")
-        if not firebase_status()["ready"]:
+        status = firebase_status()
+        if not status["ready"]:
             return jsonify({
                 "error": "Server authentication is temporarily unavailable. Please contact the admin.",
                 "code": "firebase_not_configured",
+                "diagnostic": status["reason"],
+                "missingConfiguration": status["missing_env_vars"],
             }), 503
         return jsonify({
             "error": "Invalid or expired authentication token. Please sign in again.",

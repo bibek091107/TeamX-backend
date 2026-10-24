@@ -8,14 +8,30 @@ from flask_jwt_extended import verify_jwt_in_request, get_jwt_identity
 from loguru import logger
 
 EXPECTED_FIREBASE_PROJECT_ID = "teamcollab-9b857"
+FIREBASE_ENV_CREDENTIALS = (
+    "FIREBASE_PROJECT_ID",
+    "FIREBASE_CLIENT_EMAIL",
+    "FIREBASE_PRIVATE_KEY",
+)
 _firebase_ready = False
 _firebase_init_error = "not_initialized"
+_firebase_source = "none"
+_firebase_exception_type = ""
+_firebase_env_presence = {name: False for name in FIREBASE_ENV_CREDENTIALS}
+_firebase_missing_env = list(FIREBASE_ENV_CREDENTIALS)
 
 
 def firebase_status():
     """Return safe Firebase Admin startup diagnostics (never credentials)."""
-    return {"ready": _firebase_ready, "project_id": EXPECTED_FIREBASE_PROJECT_ID,
-            "reason": _firebase_init_error}
+    return {
+        "ready": _firebase_ready,
+        "project_id": EXPECTED_FIREBASE_PROJECT_ID,
+        "source": _firebase_source,
+        "reason": _firebase_init_error,
+        "exception_type": _firebase_exception_type,
+        "env_vars_present": dict(_firebase_env_presence),
+        "missing_env_vars": list(_firebase_missing_env),
+    }
 
 
 def init_firebase():
@@ -25,38 +41,71 @@ def init_firebase():
     GOOGLE_APPLICATION_CREDENTIALS can point ADC at a service-account file;
     on Google-hosted runtimes the attached service identity is used directly.
     """
-    global _firebase_ready, _firebase_init_error
+    global _firebase_ready, _firebase_init_error, _firebase_source, _firebase_exception_type
+    global _firebase_env_presence, _firebase_missing_env
     _firebase_ready = False
     _firebase_init_error = "not_configured"
+    _firebase_source = "none"
+    _firebase_exception_type = ""
+    _firebase_env_presence = {
+        name: bool(os.getenv(name, "").strip())
+        for name in FIREBASE_ENV_CREDENTIALS
+    }
+    _firebase_missing_env = [name for name, present in _firebase_env_presence.items() if not present]
+    source = "configuration"
+    failure_reason = None
     try:
         import firebase_admin
         from firebase_admin import credentials
 
         expected_project = os.getenv("FIREBASE_PROJECT_ID", EXPECTED_FIREBASE_PROJECT_ID).strip()
         if expected_project != EXPECTED_FIREBASE_PROJECT_ID:
+            failure_reason = "project_mismatch"
             raise ValueError("FIREBASE_PROJECT_ID does not match the configured application project")
 
         if firebase_admin._apps:
-            app = firebase_admin.get_app()
-            actual_project = app.project_id or app.options.get("projectId")
-            if actual_project != expected_project:
-                raise ValueError("Existing Firebase Admin app targets a different project")
-            _firebase_ready = True
-            _firebase_init_error = ""
-            logger.info("Firebase Admin ready: project_id={} source=existing_app", expected_project)
-            return True
+            try:
+                app = firebase_admin.get_app()
+            except ValueError:
+                # A named app may exist without the default app. Keep searching
+                # for the default app instead of treating that as initialized.
+                app = None
+            if app is not None:
+                actual_project = app.project_id or app.options.get("projectId")
+                existing_credential_project = getattr(getattr(app, "credential", None), "project_id", None)
+                if actual_project != expected_project or (
+                    existing_credential_project and existing_credential_project != expected_project
+                ):
+                    failure_reason = "project_mismatch"
+                    raise ValueError("Existing Firebase Admin app targets a different project")
+                _firebase_ready = True
+                _firebase_init_error = ""
+                _firebase_source = "existing_app"
+                logger.info("Firebase Admin ready: project_id={} source=existing_app", expected_project)
+                return True
 
         configured_service_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH")
         service_path = configured_service_path or "./firebase-service-account.json"
         if configured_service_path and not os.path.isfile(service_path):
+            source = "service_account_file"
+            failure_reason = "service_account_file_not_found"
             raise FileNotFoundError("FIREBASE_SERVICE_ACCOUNT_PATH does not exist")
         if os.path.isfile(service_path):
-            cred = credentials.Certificate(service_path)
             source = "service_account_file"
-        elif all(os.getenv(name) for name in ("FIREBASE_PROJECT_ID", "FIREBASE_PRIVATE_KEY", "FIREBASE_CLIENT_EMAIL")):
-            private_key = os.environ["FIREBASE_PRIVATE_KEY"].replace("\\n", "\n")
+            cred = credentials.Certificate(service_path)
+        elif any(_firebase_env_presence.values()) and not all(_firebase_env_presence.values()):
+            source = "environment_variables"
+            failure_reason = "incomplete_environment_credentials"
+            raise ValueError("Firebase Admin environment credential set is incomplete")
+        elif all(_firebase_env_presence.values()):
+            source = "environment_variables"
+            private_key = os.environ["FIREBASE_PRIVATE_KEY"].replace("\\n", "\n").strip()
             client_email = os.environ["FIREBASE_CLIENT_EMAIL"].strip()
+            if not private_key.startswith("-----BEGIN PRIVATE KEY-----") or not private_key.endswith("-----END PRIVATE KEY-----"):
+                failure_reason = "malformed_private_key"
+                raise ValueError("Firebase private key is not valid PEM")
             if not client_email.endswith(f"@{expected_project}.iam.gserviceaccount.com"):
+                failure_reason = "project_mismatch"
                 raise ValueError("Firebase service account email does not match the configured project")
             sa = {
                 "type": "service_account", "project_id": expected_project,
@@ -66,31 +115,48 @@ def init_firebase():
                 "token_uri": "https://oauth2.googleapis.com/token",
             }
             cred = credentials.Certificate(sa)
-            source = "environment_variables"
         else:
+            source = "application_default_credentials"
             import google.auth
             _, adc_project = google.auth.default()
             if adc_project != expected_project:
+                failure_reason = "project_mismatch"
                 raise ValueError("Application Default Credentials project does not match FIREBASE_PROJECT_ID")
             cred = credentials.ApplicationDefault()
-            source = "application_default_credentials"
 
         credential_project = getattr(cred, "project_id", None)
         if credential_project and credential_project != expected_project:
+            failure_reason = "project_mismatch"
             raise ValueError("Firebase credential project does not match FIREBASE_PROJECT_ID")
 
         firebase_admin.initialize_app(cred, {"projectId": expected_project})
         _firebase_ready = True
         _firebase_init_error = ""
+        _firebase_source = source
+        _firebase_exception_type = ""
         logger.info("Firebase Admin ready: project_id={} source={}", expected_project, source)
         return True
     except Exception as exc:
-        # Log a bounded reason and exception class only; SDK exception text can
-        # contain request details and must not be copied into client responses.
-        reason = str(exc).lower()
-        _firebase_init_error = "project_mismatch" if "project" in reason else type(exc).__name__
-        logger.error("Firebase Admin initialization failed: reason={} exception_type={}",
-                     _firebase_init_error, type(exc).__name__)
+        # Never log SDK exception text: it can contain credential or request
+        # details. Variable names/presence and exception class are sufficient.
+        if failure_reason:
+            reason = failure_reason
+        elif source in ("environment_variables", "service_account_file") and isinstance(exc, ValueError):
+            reason = "invalid_service_account_credentials"
+        elif source == "application_default_credentials":
+            reason = "adc_unavailable"
+        elif source in ("environment_variables", "service_account_file"):
+            reason = "service_account_initialization_failed"
+        else:
+            reason = "initialization_failed"
+        _firebase_init_error = reason
+        _firebase_source = source
+        _firebase_exception_type = type(exc).__name__
+        missing = ",".join(_firebase_missing_env) or "none"
+        logger.error(
+            "Firebase Admin initialization failed: source={} reason={} exception_type={} missing_env_vars={}",
+            source, reason, type(exc).__name__, missing,
+        )
         return False
 
 
