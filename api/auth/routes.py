@@ -26,13 +26,23 @@ def _generate_invite_code(length=8):
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
 
+from services.firestore_service import (
+    save_team_to_firestore,
+    delete_team_from_firestore,
+    save_membership_to_firestore,
+    remove_membership_from_firestore,
+    sync_user_teams,
+)
+
+
 # ── Firebase token exchange ────────────────────────────────────
 
 @auth_bp.route("/firebase-login", methods=["POST"])
 def firebase_login():
     data         = request.get_json() or {}
     id_token     = data.get("idToken", "")
-    email        = data.get("email", "")
+    raw_email    = data.get("email", "")
+    norm_email   = raw_email.strip().lower() if raw_email else ""
     display_name = data.get("displayName", "")
     firebase_uid = None
     avatar_url   = ""
@@ -40,60 +50,98 @@ def firebase_login():
 
     # Try real Firebase verification first
     try:
-        decoded      = verify_firebase_token(id_token)
-        firebase_uid = decoded["uid"]
-        email        = decoded.get("email", email)
-        display_name = decoded.get("name", display_name) or email.split("@")[0]
-        avatar_url   = decoded.get("picture", "")
+        decoded        = verify_firebase_token(id_token)
+        firebase_uid   = decoded["uid"]
+        token_email    = (decoded.get("email") or "").strip().lower()
+        norm_email     = token_email or norm_email
+        display_name   = decoded.get("name", display_name) or norm_email.split("@")[0]
+        avatar_url     = decoded.get("picture", "")
         email_verified = bool(decoded.get("email_verified", False)) or bool(data.get("emailVerified", False))
-        logger.info(f"Firebase auth OK: {email} (verified={email_verified})")
+        logger.info(f"Firebase auth OK: {norm_email} (uid={firebase_uid}, verified={email_verified})")
     except Exception as firebase_err:
-        # Dev mode fallback — reachable ONLY when the server itself is running
-        # in development mode (FLASK_ENV=development, the local default).
-        #
-        # SECURITY FIX: this used to also accept any client-supplied idToken
-        # starting with "mock_", regardless of FLASK_ENV. That meant anyone,
-        # in any environment including production, could authenticate as an
-        # arbitrary email address just by sending {"idToken": "mock_x", ...}
-        # with no real credentials. The client can no longer opt itself into
-        # the dev-mode fallback — only the server's own environment can.
         is_dev = os.getenv("FLASK_ENV", "development") == "development"
         if is_dev:
-            if not email:
-                return jsonify({"error": "Email required"}), 400
-            firebase_uid = f"dev_{email.replace('@','_').replace('.','_')}"
-            display_name = display_name or email.split("@")[0]
+            if not norm_email:
+                norm_email = "dev@teamx.app"
+            firebase_uid   = f"dev_{norm_email.replace('@','_').replace('.','_')}"
+            display_name   = display_name or norm_email.split("@")[0]
             email_verified = True  # dev accounts can't receive verification emails
-            logger.warning(f"Dev-mode login: {email}")
+            logger.warning(f"Dev-mode login: {norm_email} (uid={firebase_uid})")
         else:
             logger.warning(
                 f"Rejected unverifiable Firebase token outside dev mode: {firebase_err}"
             )
             return jsonify({"error": "Invalid Firebase token"}), 401
 
-    # Upsert user
+    if not norm_email:
+        return jsonify({"error": "Email is required"}), 400
+
+    # Resilient user lookup:
+    # 1. Try finding by firebase_uid
+    # 2. If not found, lookup by case-insensitive email to link pre-existing accounts
     user = User.query.filter_by(firebase_uid=firebase_uid).first()
+    if not user and norm_email:
+        user = User.query.filter(db.func.lower(User.email) == norm_email).first()
+
     if not user:
         user = User(
             firebase_uid=firebase_uid,
-            email=email,
-            display_name=display_name or email.split("@")[0],
+            email=norm_email,
+            display_name=display_name or norm_email.split("@")[0],
             avatar_url=avatar_url,
             email_verified=email_verified,
         )
         db.session.add(user)
-        logger.info(f"New user: {email} (verified={email_verified})")
+        logger.info(f"New user registered: {norm_email} (uid={firebase_uid})")
     else:
-        user.last_seen    = datetime.utcnow()
-        user.display_name = display_name or user.display_name
+        # Link / update verified Firebase UID and credentials
+        if user.firebase_uid != firebase_uid:
+            logger.info(f"Linking existing account {user.email} (old uid={user.firebase_uid}) to new Firebase UID: {firebase_uid}")
+            user.firebase_uid = firebase_uid
+
+        user.email = norm_email
+        user.last_seen = datetime.utcnow()
+        if display_name:
+            user.display_name = display_name
         user.email_verified = email_verified
         if avatar_url:
             user.avatar_url = avatar_url
 
     db.session.commit()
+
+    # Reconcile team memberships persistently with Firestore cloud storage
+    try:
+        sync_user_teams(user)
+    except Exception as sync_err:
+        logger.warning(f"Firestore team sync warning on login: {sync_err}")
+
+    # Gather user's verified teams
+    memberships = TeamMember.query.filter_by(user_id=user.id).all()
+    teams = []
+    for m in memberships:
+        if m.team:
+            data = m.team.to_dict()
+            data["membershipStatus"] = m.status or "active"
+            teams.append(data)
+
+    last_team_id = user.last_active_team_id
+    if last_team_id:
+        is_active_member = any(t["id"] == last_team_id and t.get("membershipStatus") == "active" for t in teams)
+        if not is_active_member:
+            last_team_id = teams[0]["id"] if teams else None
+            user.last_active_team_id = last_team_id
+            db.session.commit()
+
     access_token  = create_access_token(identity=user.id)
     refresh_token = create_refresh_token(identity=user.id)
-    return jsonify({"accessToken": access_token, "refreshToken": refresh_token, "user": user.to_dict()})
+
+    return jsonify({
+        "accessToken": access_token,
+        "refreshToken": refresh_token,
+        "user": user.to_dict(),
+        "teams": teams,
+        "lastActiveTeamId": last_team_id,
+    })
 
 
 # ── Token refresh ───────────────────────────────────────────────
@@ -142,6 +190,12 @@ def update_profile():
 @auth_bp.route("/teams", methods=["GET"])
 @require_auth
 def get_my_teams():
+    # Sync persistent memberships from Firestore cloud storage
+    try:
+        sync_user_teams(g.current_user)
+    except Exception as e:
+        logger.warning(f"Firestore sync in get_my_teams: {e}")
+
     memberships = TeamMember.query.filter_by(user_id=g.current_user.id).all()
     teams = []
     for m in memberships:
@@ -154,8 +208,15 @@ def get_my_teams():
     if last_team_id:
         is_active_member = any(t["id"] == last_team_id and t.get("membershipStatus") == "active" for t in teams)
         if not is_active_member:
-            last_team_id = None
-            g.current_user.last_active_team_id = None
+            last_team_id = teams[0]["id"] if teams else None
+            g.current_user.last_active_team_id = last_team_id
+            db.session.commit()
+    elif teams:
+        # Default to first active team if last_team_id was null
+        active_candidates = [t for t in teams if t.get("membershipStatus") == "active"]
+        if active_candidates:
+            last_team_id = active_candidates[0]["id"]
+            g.current_user.last_active_team_id = last_team_id
             db.session.commit()
 
     return jsonify({
@@ -206,7 +267,8 @@ def create_team():
     db.session.add(team)
     db.session.flush()
 
-    db.session.add(TeamMember(team_id=team.id, user_id=g.current_user.id, role="owner", status="active"))
+    member = TeamMember(team_id=team.id, user_id=g.current_user.id, role="owner", status="active")
+    db.session.add(member)
     db.session.add(ChatRoom(
         team_id=team.id, name="general",
         description="General discussion", room_type="general",
@@ -219,6 +281,14 @@ def create_team():
     ))
     g.current_user.last_active_team_id = team.id
     db.session.commit()
+
+    # Persist team and owner membership in Firestore
+    try:
+        save_team_to_firestore(team)
+        save_membership_to_firestore(team, g.current_user, role="owner", status="active")
+    except Exception as e:
+        logger.warning(f"Firestore persistence warning on create_team: {e}")
+
     logger.info(f"Team '{name}' created by {g.current_user.email} (require_approval={team.require_approval})")
     data = team.to_dict(include_members=True)
     data["membershipStatus"] = "active"
@@ -243,7 +313,8 @@ def join_team():
     # Sub-groups (require_approval) need the owner's OK before the member is
     # admitted; the main team joins directly.
     status = "pending" if team.require_approval else "active"
-    db.session.add(TeamMember(team_id=team.id, user_id=g.current_user.id, role="member", status=status))
+    new_member = TeamMember(team_id=team.id, user_id=g.current_user.id, role="member", status=status)
+    db.session.add(new_member)
     db.session.add(ActivityLog(
         team_id=team.id, user_id=g.current_user.id,
         action="join_requested" if status == "pending" else "member_joined",
@@ -255,6 +326,13 @@ def join_team():
     if status == "active":
         g.current_user.last_active_team_id = team.id
     db.session.commit()
+
+    # Persist membership in Firestore
+    try:
+        save_membership_to_firestore(team, g.current_user, role="member", status=status)
+    except Exception as e:
+        logger.warning(f"Firestore persistence warning on join_team: {e}")
+
     data = team.to_dict(include_members=True)
     data["membershipStatus"] = status
     return jsonify({"team": data, "lastActiveTeamId": g.current_user.last_active_team_id})
@@ -294,6 +372,14 @@ def approve_join_request(team_id, membership_id):
         description=f"{membership.user.display_name if membership.user else 'Member'} was approved",
     ))
     db.session.commit()
+
+    # Persist active membership in Firestore
+    try:
+        if membership.team and membership.user:
+            save_membership_to_firestore(membership.team, membership.user, role=membership.role, status="active")
+    except Exception as e:
+        logger.warning(f"Firestore persistence warning on approve_join_request: {e}")
+
     logger.info(f"Approved join request {membership_id} for team {team_id}")
     return jsonify({"message": "Join request approved", "membership": membership.to_dict()})
 
@@ -310,8 +396,19 @@ def reject_join_request(team_id, membership_id):
     ).first()
     if not membership:
         return jsonify({"error": "Join request not found"}), 404
+
+    target_user_id = membership.user_id
+    target_firebase_uid = membership.user.firebase_uid if membership.user else None
+
     db.session.delete(membership)
     db.session.commit()
+
+    # Remove membership from Firestore
+    try:
+        remove_membership_from_firestore(team_id, target_user_id, firebase_uid=target_firebase_uid)
+    except Exception as e:
+        logger.warning(f"Firestore remove warning on reject_join_request: {e}")
+
     logger.info(f"Rejected join request {membership_id} for team {team_id}")
     return jsonify({"message": "Join request rejected"})
 
@@ -345,6 +442,13 @@ def regenerate_invite(team_id):
     team = Team.query.get(team_id)
     team.invite_code = _generate_invite_code()
     db.session.commit()
+
+    # Update Firestore team with new invite code
+    try:
+        save_team_to_firestore(team)
+    except Exception as e:
+        logger.warning(f"Firestore update invite code warning: {e}")
+
     return jsonify({"inviteCode": team.invite_code})
 
 
@@ -366,33 +470,26 @@ def delete_team(team_id):
 
     try:
         # Delete all related data in correct order (foreign key constraints)
-        # 1. Notifications
         Notification.query.filter_by(team_id=team_id).delete()
-
-        # 2. Daily summaries
         DailySummary.query.filter_by(team_id=team_id).delete()
-
-        # 3. Activity logs
         ActivityLog.query.filter_by(team_id=team_id).delete()
-
-        # 4. Tasks
         Task.query.filter_by(team_id=team_id).delete()
-
-        # 5. Knowledge items
         KnowledgeItem.query.filter_by(team_id=team_id).delete()
 
-        # 6. Chat messages (via rooms)
         rooms = ChatRoom.query.filter_by(team_id=team_id).all()
         for room in rooms:
             ChatMessage.query.filter_by(room_id=room.id).delete()
         ChatRoom.query.filter_by(team_id=team_id).delete()
 
-        # 7. Team members
         TeamMember.query.filter_by(team_id=team_id).delete()
-
-        # 8. Team itself
         db.session.delete(team)
         db.session.commit()
+
+        # Delete from Firestore cloud persistence
+        try:
+            delete_team_from_firestore(team_id)
+        except Exception as fs_err:
+            logger.warning(f"Firestore delete warning: {fs_err}")
 
         logger.info(f"Team '{team.name}' deleted by {g.current_user.email}")
         return jsonify({"message": "Team deleted successfully"})

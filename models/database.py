@@ -41,6 +41,7 @@ class User(db.Model):
     messages = db.relationship("ChatMessage", back_populates="user", lazy="dynamic")
     activities = db.relationship("ActivityLog", back_populates="user", lazy="dynamic")
     device_tokens = db.relationship("DeviceToken", back_populates="user", lazy="dynamic", cascade="all, delete-orphan")
+    task_pins = db.relationship("TaskPin", back_populates="user", lazy="dynamic", cascade="all, delete-orphan")
 
     def to_dict(self):
         return {
@@ -136,15 +137,19 @@ class Task(db.Model):
     channel_id = db.Column(db.String(36), db.ForeignKey("chat_rooms.id"), index=True)
     title = db.Column(db.String(500), nullable=False)
     description = db.Column(db.Text)
-    status = db.Column(db.String(20), default="pending")
+    status = db.Column(db.String(20), default="backlog")
     priority = db.Column(db.String(10), default="medium")
     deadline = db.Column(db.DateTime)
     deadline_text = db.Column(db.String(100))
     source = db.Column(db.String(50), default="manual")
     source_id = db.Column(db.String(36))
+    source_message_id = db.Column(db.String(36))
     ai_confidence = db.Column(db.Float, default=1.0)
     follow_up_suggestions = db.Column(db.Text)
     completed_at = db.Column(db.DateTime)
+    is_blocked = db.Column(db.Boolean, default=False)
+    blocked_reason = db.Column(db.Text)
+    blocked_at = db.Column(db.DateTime)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -152,6 +157,10 @@ class Task(db.Model):
     assignee = db.relationship("User", foreign_keys=[assignee_id], back_populates="tasks_assigned")
     creator = db.relationship("User", foreign_keys=[creator_id], back_populates="tasks_created")
     channel = db.relationship("ChatRoom", back_populates="tasks")
+    activity = db.relationship("TaskActivity", back_populates="task", lazy="dynamic", cascade="all, delete-orphan")
+    subtasks = db.relationship("TaskSubtask", back_populates="task", lazy="dynamic", cascade="all, delete-orphan")
+    labels = db.relationship("TaskLabel", back_populates="task", lazy="dynamic", cascade="all, delete-orphan")
+    pins = db.relationship("TaskPin", back_populates="task", lazy="dynamic", cascade="all, delete-orphan")
 
     def to_dict(self):
         import json
@@ -170,9 +179,14 @@ class Task(db.Model):
             "assigneeId": self.assignee_id,
             "creator": self.creator.to_dict() if self.creator else None,
             "source": self.source,
+            "sourceId": self.source_id,
+            "sourceMessageId": self.source_message_id,
             "aiConfidence": self.ai_confidence,
             "followUpSuggestions": json.loads(self.follow_up_suggestions) if self.follow_up_suggestions else [],
             "completedAt": self.completed_at.isoformat() if self.completed_at else None,
+            "isBlocked": bool(self.is_blocked),
+            "blockedReason": self.blocked_reason,
+            "blockedAt": self.blocked_at.isoformat() if self.blocked_at else None,
             "createdAt": self.created_at.isoformat(),
             "updatedAt": self.updated_at.isoformat()
         }
@@ -309,9 +323,104 @@ class KnowledgeItem(db.Model):
         }
 
 
-# ─────────────────────────────────────────────
-# ACTIVITY & NOTIFICATION MODELS
-# ─────────────────────────────────────────────
+class TaskActivity(db.Model):
+    __tablename__ = "task_activity"
+
+    id = db.Column(db.String(36), primary_key=True, default=generate_uuid)
+    task_id = db.Column(db.String(36), db.ForeignKey("tasks.id"), nullable=False, index=True)
+    team_id = db.Column(db.String(36), db.ForeignKey("teams.id"), index=True)
+    user_id = db.Column(db.String(36), db.ForeignKey("users.id"), index=True)
+    action = db.Column(db.String(50), nullable=False)
+    previous_status = db.Column(db.String(20))
+    new_status = db.Column(db.String(20))
+    details = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    task = db.relationship("Task", back_populates="activity")
+    user = db.relationship("User")
+
+    def to_dict(self):
+        import json
+        return {
+            "id": self.id,
+            "taskId": self.task_id,
+            "teamId": self.team_id,
+            "userId": self.user_id,
+            "user": self.user.to_dict() if self.user else None,
+            "action": self.action,
+            "previousStatus": self.previous_status,
+            "newStatus": self.new_status,
+            "details": json.loads(self.details) if self.details else None,
+            "createdAt": self.created_at.isoformat()
+        }
+
+
+class TaskSubtask(db.Model):
+    __tablename__ = "task_subtasks"
+
+    id = db.Column(db.String(36), primary_key=True, default=generate_uuid)
+    task_id = db.Column(db.String(36), db.ForeignKey("tasks.id"), nullable=False, index=True)
+    title = db.Column(db.String(500), nullable=False)
+    is_completed = db.Column(db.Boolean, default=False)
+    position = db.Column(db.Integer, default=0)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    task = db.relationship("Task", back_populates="subtasks")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "taskId": self.task_id,
+            "title": self.title,
+            "isCompleted": bool(self.is_completed),
+            "position": self.position,
+            "createdAt": self.created_at.isoformat(),
+            "updatedAt": self.updated_at.isoformat()
+        }
+
+
+class TaskLabel(db.Model):
+    __tablename__ = "task_labels"
+
+    id = db.Column(db.String(36), primary_key=True, default=generate_uuid)
+    task_id = db.Column(db.String(36), db.ForeignKey("tasks.id"), nullable=False, index=True)
+    name = db.Column(db.String(50), nullable=False)
+    color = db.Column(db.String(20), default="#6366f1")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    task = db.relationship("Task", back_populates="labels")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "taskId": self.task_id,
+            "name": self.name,
+            "color": self.color,
+            "createdAt": self.created_at.isoformat()
+        }
+
+
+class TaskPin(db.Model):
+    __tablename__ = "task_pins"
+
+    id = db.Column(db.String(36), primary_key=True, default=generate_uuid)
+    user_id = db.Column(db.String(36), db.ForeignKey("users.id"), nullable=False, index=True)
+    task_id = db.Column(db.String(36), db.ForeignKey("tasks.id"), nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    user = db.relationship("User", back_populates="task_pins")
+    task = db.relationship("Task", back_populates="pins")
+
+    __table_args__ = (db.UniqueConstraint('user_id', 'task_id', name='unique_user_task_pin'),)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "userId": self.user_id,
+            "taskId": self.task_id,
+            "createdAt": self.created_at.isoformat()
+        }
 
 class ActivityLog(db.Model):
     __tablename__ = "activity_logs"

@@ -189,13 +189,25 @@ def create_app():
         except Exception:
             db.session.rollback()
 
-        # Lightweight migration: tasks.channel_id
+        # Lightweight migration: tasks new fields
+        for col, ctype in [
+            ("source_message_id", "VARCHAR(36)"),
+            ("is_blocked", "BOOLEAN DEFAULT 0"),
+            ("blocked_reason", "TEXT"),
+            ("blocked_at", "DATETIME"),
+        ]:
+            try:
+                db.session.execute(_sql(f"ALTER TABLE tasks ADD COLUMN {col} {ctype}"))
+                db.session.commit()
+                logger.info(f"✅ Migration: added tasks.{col}")
+            except Exception:
+                db.session.rollback()
+
+        # Create new tables if not exist
         try:
-            db.session.execute(_sql("ALTER TABLE tasks ADD COLUMN channel_id VARCHAR(36)"))
-            db.session.commit()
-            logger.info("✅ Migration: added tasks.channel_id")
+            db.create_all()
         except Exception:
-            db.session.rollback()
+            pass
 
         # Lightweight migration: notifications.extra_data
         try:
